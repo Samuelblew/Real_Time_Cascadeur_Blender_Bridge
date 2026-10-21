@@ -1206,7 +1206,11 @@ def apply_pose_to_cascadeur(pose_packet, scene=None):
                         continue
 
                     dq = bdata.get("delta_rot")
-                    if dq and len(dq) == 4:
+                    absolute = bdata.get('absolute_rot')
+                    if absolute and len(absolute) == 4:
+                        q_absolute = csc.math.Quaternion(*[float(v) for v in absolute])
+                        target_global_rotations[j_name] = csc.math.Rotation.from_quaternion(q_absolute)
+                    elif dq and len(dq) == 4:
                         try:
                             q_delta = csc.math.Quaternion(float(dq[0]), float(dq[1]), float(dq[2]), float(dq[3]))
                             r_delta = csc.math.Rotation.from_quaternion(q_delta)
@@ -1254,7 +1258,10 @@ def apply_pose_to_cascadeur(pose_packet, scene=None):
                     is_root_bone = (state.parent_key is None) or (bdata and bdata.get("is_root", False))
                     is_unposed_bone = bool(bdata and bdata.get("is_unposed", False))
 
-                    if is_unposed_bone and not is_root_bone:
+                    if bdata and bdata.get('export_local_rot') is not None:
+                        local_rot = csc.math.Rotation.from_quaternion(csc.math.Quaternion(*[float(v) for v in bdata['export_local_rot']]))
+                        local_pos = _to_numpy_vec3(bdata['export_local_pos'])
+                    elif is_unposed_bone and not is_root_bone:
                         # Unposed joint in Blender: preserve exact anatomical model_local_rotation without numerical drift
                         local_rot = state.model_local_rotation
                         local_pos = state.model_local_position
@@ -1364,7 +1371,7 @@ def apply_pose_to_cascadeur(pose_packet, scene=None):
                             bdata = bones.get(j_name) or bones.get(normalize_name(j_name))
 
                         is_root = (state.parent_key is None) or (bdata and bdata.get("is_root", False))
-                        if is_root:
+                        if is_root or (bdata and bdata.get('export_local_pos') is not None):
                             lp_id = bv.get_behaviour_data(state.transform_id, "local_position")
                             local_pos = final_local_positions.get(j_name)
                             if is_valid_id(lp_id) and local_pos is not None:

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Cascadeur Real-Time Live Link",
     "author": "Carlos Barreto, Antigravity",
-    "version": (1, 2, 1),
+    "version": (1, 4, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > CEB",
     "description": "Stream character animation from Cascadeur to Blender armatures in real time via UDP.",
@@ -17,10 +17,12 @@ from bpy.props import (
     EnumProperty,
     PointerProperty,
     FloatProperty,
+    CollectionProperty,
 )
 
 from . import operators
 from . import panel
+from . import profiles
 
 
 def update_rig_type(self, context):
@@ -47,6 +49,10 @@ def update_target_armature(self, context):
 
 
 class CascadeurLiveLinkSettings(bpy.types.PropertyGroup):
+    rig_profile: EnumProperty(name='Perfil de ossos',items=profiles.PROFILES,default='EXPORTED')
+    mapping_only: BoolProperty(name='Somente pares habilitados',default=False,update=profiles.edited)
+    bone_mapping: CollectionProperty(type=profiles.BonePair)
+
     sync_cascadeur_keys: BoolProperty(name="Sincronizar chaves Cascadeur → Blender", default=True)
     sync_blender_keys: BoolProperty(name="Enviar ao inserir/alterar chaves no Blender", default=True)
     key_range_start: IntProperty(name="Inicio", default=0)
@@ -102,6 +108,7 @@ class CascadeurLiveLinkSettings(bpy.types.PropertyGroup):
         name="Pose Mode",
         description="Method used to calculate bone rotations in Blender",
         items=[
+            ("GLOBAL_MATRIX", "Same Exported Rig / Global Transforms", "Use original joint world orientations; suitable for the original Blender export rig"),
             ("GLOBAL_DELTA", "Same Rig / Global Delta", "Preserve streamed joint transforms on the same exported skeleton"),
             ("GLOBAL_AIM", "Global Position Aim (Recommended)", "Solve bone rotations directly from 3D joint positions (ignores bone roll / rest pose mismatch)"),
             ("LOCAL_ROT", "Local FK Hierarchy", "Apply local bone rotation quaternions directly"),
@@ -251,6 +258,7 @@ class CascadeurLiveLinkSettings(bpy.types.PropertyGroup):
 
 
 classes = (
+    profiles.BonePair,
     CascadeurLiveLinkSettings,
 )
 
@@ -280,6 +288,7 @@ def register():
     keyframe_bridge.register()
     from . import live_sync
     live_sync.register()
+    profiles.register()
     panel.register()
     bpy.app.handlers.load_post.append(reset_connection_after_load)
 
@@ -295,6 +304,7 @@ def unregister():
     live_sync.unregister()
     keyframe_bridge.unregister()
     panel.unregister()
+    profiles.unregister()
     operators.unregister()
 
     del bpy.types.Scene.cascadeur_live_link

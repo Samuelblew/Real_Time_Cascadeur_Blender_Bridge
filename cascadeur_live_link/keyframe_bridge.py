@@ -9,6 +9,61 @@ from mathutils import Matrix, Quaternion, Vector
 from . import operators
 
 
+def prepare_joint_translation(arm, context):
+    """Free exported joint translations without changing parenting, rest heads or weights."""
+    names = [b.name for b in arm.data.bones if b.use_connect]
+    if not names:
+        return 0
+    selected = list(context.selected_objects)
+    active = context.view_layer.objects.active
+    old_mode = active.mode if active else 'OBJECT'
+    poses = {pb.name:pb.matrix.copy() for pb in arm.pose.bones}
+    if active and active.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    for obj in selected:
+        obj.select_set(False)
+    arm.select_set(True)
+    context.view_layer.objects.active = arm
+    if arm.data.users > 1:
+        arm.data = arm.data.copy()
+    try:
+        bpy.ops.object.mode_set(mode='EDIT')
+        for name in names:
+            arm.data.edit_bones[name].use_connect = False
+        bpy.ops.object.mode_set(mode='OBJECT')
+        for pb in sorted(arm.pose.bones,key=lambda b:len(b.parent_recursive)):
+            pb.matrix = poses[pb.name]
+            context.view_layer.update()
+        arm['cascadeur_previously_connected'] = json.dumps(names)
+    finally:
+        if arm.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        arm.select_set(False)
+        for obj in selected:
+            obj.select_set(True)
+        context.view_layer.objects.active = active
+        if active and old_mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode=old_mode)
+    return len(names)
+
+
+class CASCADEUR_OT_prepare_joint_translation(bpy.types.Operator):
+    bl_idname = 'cascadeur.prepare_joint_translation'
+    bl_label = 'Permitir translacao dos joints'
+    bl_description = 'Libera Connected apenas no rig de destino, preservando hierarquia e rest pose'
+    bl_options = {'REGISTER','UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.cascadeur_live_link
+        arm = settings.target_armature
+        if arm is None or settings.is_connected:
+            self.report({'ERROR'},'Escolha o rig e pare Live Link antes de preparar')
+            return {'CANCELLED'}
+        count = prepare_joint_translation(arm, context)
+        self.report({'INFO'},f'{count} joints liberados apenas em {arm.name}')
+        return {'FINISHED'}
+
+
 def capture_pose(arm, settings):
     conversion = (Matrix.Rotation(-1.5707963267948966, 4, 'X')
                   if settings.coord_conversion == 'Y_UP_TO_Z_UP' else Matrix.Identity(4))
@@ -22,6 +77,19 @@ def capture_pose(arm, settings):
         bones[pb.name] = {'delta_rot': list(delta.normalized()), 'g_rot': list(delta.normalized()),
                          'g_pos': list(pos), 'pos': list(pos), 'is_root': operators.is_pelvis_or_root(pb),
                          'is_unposed': False}
+        if settings.pose_mapping_mode == 'GLOBAL_MATRIX':
+            bones[pb.name] = {'absolute_rot': list((cq @ world.to_quaternion()).normalized()),
+                              'g_pos': list(pos), 'is_root': operators.is_pelvis_or_root(pb), 'is_unposed': False}
+            local = pb.parent.matrix.inverted() @ pb.matrix if pb.parent else pb.matrix
+            bones[pb.name]['export_local_rot'] = list(local.to_quaternion().normalized())
+            bones[pb.name]['export_local_pos'] = list(local.translation)
+    rows = list(getattr(settings,'bone_mapping',[]))
+    if rows or getattr(settings,'mapping_only',False):
+        reverse = {r.target:r.source for r in rows if r.enabled and r.source and r.target}
+        if len(reverse) != sum(bool(r.enabled and r.source and r.target) for r in rows):
+            raise ValueError('Dois joints mapeados para o mesmo osso; revise o perfil')
+        bones = {reverse.get(name,name):tf for name,tf in bones.items()
+                 if name in reverse or (not settings.mapping_only and not any(r.target==name for r in rows))}
     return bones
 
 
@@ -93,11 +161,11 @@ def commit_pose(packet, arm, settings, context, record=True, sync_frame=True):
     if not matched:
         raise ValueError("Nenhum osso correspondente; confira o rig de destino")
     # Use the real cursor, never the receiver's cached last frame.
-    if sync_frame or record:
+    if (sync_frame or record) and context.scene.frame_current != int(packet["frame"]):
         context.scene.frame_set(int(packet["frame"]))
     if record and arm.animation_data and arm.animation_data.action and arm.animation_data.action.users > 1:
         arm.animation_data.action = arm.animation_data.action.copy()
-    if settings.pose_mapping_mode == 'GLOBAL_DELTA':
+    if settings.pose_mapping_mode in {'GLOBAL_DELTA','GLOBAL_MATRIX'}:
         conversion = (Matrix.Rotation(1.5707963267948966, 4, 'X')
                       if settings.coord_conversion == 'Y_UP_TO_Z_UP' else Matrix.Identity(4))
         conv_q = conversion.to_quaternion()
@@ -107,24 +175,34 @@ def commit_pose(packet, arm, settings, context, record=True, sync_frame=True):
             pb = operators.find_matching_bone(arm.pose.bones, name, settings.bone_name_prefix.strip(),
                  smart_map=settings.auto_map_synonyms, is_cc5=operators.is_rig_cc5(arm, settings))
             if pb:
-                if 'delta_rot' not in transform or 'g_pos' not in transform:
-                    raise ValueError('Same Rig requer delta_rot e g_pos; use Local FK para este emissor')
+                required = 'g_rot' if settings.pose_mapping_mode == 'GLOBAL_MATRIX' else 'delta_rot'
+                if required not in transform or 'g_pos' not in transform:
+                    raise ValueError(f'Modo selecionado requer {required} e g_pos no emissor')
                 by_name[pb.name] = transform
         def depth(pb):
             return len(pb.parent_recursive)
-        last_depth = -1
+        desired = {}
         for pb in sorted(matched.values(), key=depth):
-            if depth(pb) != last_depth:
-                context.view_layer.update()
-                last_depth = depth(pb)
             tf = by_name[pb.name]
-            delta = conv_q @ Quaternion(tf['delta_rot']).normalized() @ conv_q.inverted()
             rest_world = arm.matrix_world @ pb.bone.matrix_local
-            rotation = delta @ rest_world.to_quaternion()
+            if settings.pose_mapping_mode == 'GLOBAL_MATRIX':
+                rotation = conv_q @ Quaternion(tf['g_rot']).normalized()
+            else:
+                delta = conv_q @ Quaternion(tf['delta_rot']).normalized() @ conv_q.inverted()
+                rotation = delta @ rest_world.to_quaternion()
             position = conversion @ (Vector(tf['g_pos']) * settings.translation_scale)
             world = Matrix.LocRotScale(position, rotation, rest_world.to_scale())
             pb.rotation_mode = 'QUATERNION'
-            pb.matrix = arm_inv @ world
+            target = arm_inv @ world
+            if settings.pose_mapping_mode == 'GLOBAL_DELTA' and settings.apply_root_only_translation and pb.parent:
+                parent = desired.get(pb.parent.name, pb.parent.matrix)
+                target.translation = (parent @ pb.parent.bone.matrix_local.inverted() @ pb.bone.matrix_local).translation
+            kwargs = {}
+            if pb.parent:
+                kwargs = {'parent_matrix': desired.get(pb.parent.name, pb.parent.matrix),
+                          'parent_matrix_local': pb.parent.bone.matrix_local}
+            pb.matrix_basis = pb.bone.convert_local_to_pose(target, pb.bone.matrix_local, invert=True, **kwargs)
+            desired[pb.name] = target
         context.view_layer.update()
         settings.matched_bones_count = len(matched)
         settings.total_incoming_bones = len(packet['bones'])
@@ -134,7 +212,6 @@ def commit_pose(packet, arm, settings, context, record=True, sync_frame=True):
         for pb in matched.values():
             pb.keyframe_insert(data_path="rotation_quaternion", frame=packet["frame"], group=pb.name)
             pb.keyframe_insert(data_path="location", frame=packet["frame"], group=pb.name)
-    context.view_layer.update()
     return len(matched)
 
 
@@ -166,8 +243,10 @@ class CASCADEUR_OT_fetch_keyframe(bpy.types.Operator):
 
 
 def register():
+    bpy.utils.register_class(CASCADEUR_OT_prepare_joint_translation)
     bpy.utils.register_class(CASCADEUR_OT_fetch_keyframe)
 
 
 def unregister():
     bpy.utils.unregister_class(CASCADEUR_OT_fetch_keyframe)
+    bpy.utils.unregister_class(CASCADEUR_OT_prepare_joint_translation)

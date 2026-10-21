@@ -20,6 +20,7 @@ _active_socket = None
 _timer_registered = False
 _last_frame_applied = -1
 _last_packet_received = None
+_last_preview = None
 _initial_root_pos = None
 _scale_auto_detected = False
 _send_socket = None
@@ -376,10 +377,17 @@ _armature_depth_cache = {}
 
 def find_matching_bone(pose_bones, incoming_name, prefix="", smart_map=True, is_cc5=False):
     """Attempt to match an incoming Cascadeur joint name to a Blender pose bone with O(1) caching."""
+    settings = getattr(bpy.context.scene, 'cascadeur_live_link', None)
+    if settings and settings.target_armature and pose_bones.id_data == settings.target_armature:
+        for row in settings.bone_mapping:
+            if row.source == incoming_name:
+                return pose_bones.get(row.target) if row.enabled else None
+        if settings.mapping_only:
+            return None
     if is_cc5 and is_twist_bone(incoming_name):
         return None
 
-    cache_key = (incoming_name, prefix, smart_map, is_cc5)
+    cache_key = (pose_bones.id_data.as_pointer(), incoming_name, prefix, smart_map, is_cc5)
     if cache_key in _bone_match_cache:
         cached_name = _bone_match_cache[cache_key]
         if cached_name is None:
@@ -711,7 +719,7 @@ def apply_packet_to_rig(packet, arm_obj, settings, record, sync_frame, context):
     # Check if incoming packet has 3D global position data for GLOBAL_AIM
     has_gpos = any("g_pos" in tf for tf in matched_bones.values())
 
-    if mapping_mode == "GLOBAL_DELTA":
+    if mapping_mode in {"GLOBAL_DELTA", "GLOBAL_MATRIX"}:
         from .keyframe_bridge import commit_pose
         commit_pose(packet, arm_obj, settings, context, record=record, sync_frame=sync_frame)
     elif mapping_mode == "GLOBAL_AIM" and has_gpos:
@@ -1087,7 +1095,8 @@ def _tick_process_packets():
     This is more reliable than a modal TIMER event during active viewport interaction.
     Returns the interval in seconds to schedule the next call, or None to unregister.
     """
-    global _timer_registered
+    global _timer_registered, _last_preview
+    started = time.perf_counter()
 
     if _stop_event.is_set():
         _timer_registered = False
@@ -1167,13 +1176,20 @@ def _tick_process_packets():
         return 1.0/60.0
     if key_messages:
         try:
+            old_revision = live_sync._revision
             live_sync.apply_keys(key_messages[-1], arm_obj, settings, context)
+            if old_revision != live_sync._revision:
+                _last_preview = None
         except Exception as error:
             settings.status_message = f'Falha sincronizando chaves: {error}'
             return 1.0/60.0
     if not latest_packet:
         return 1.0/60.0
     record = settings.record_animation
+    signature = (arm_obj.as_pointer(), latest_packet['frame'], settings.pose_mapping_mode,
+                 settings.translation_scale, settings.coord_conversion, latest_packet['bones'])
+    if not record and signature == _last_preview:
+        return 1.0 / max(10,settings.update_rate_fps)
     sync_frame = settings.sync_timeline_frame
 
     if record:
@@ -1183,6 +1199,7 @@ def _tick_process_packets():
     else:
         # Live preview: apply latest packet for lowest latency (2ms execution, no lag!)
         apply_packet_to_rig(latest_packet, arm_obj, settings, record=False, sync_frame=sync_frame, context=context)
+    _last_preview = signature
     live_sync.mark_preview(arm_obj, context)
 
     # Force viewport redraw
@@ -1192,7 +1209,7 @@ def _tick_process_packets():
                 if area.type == 'VIEW_3D':
                     area.tag_redraw()
 
-    return 1.0 / 60.0  # Reschedule at 60Hz
+    return max(0.001, 1.0/settings.update_rate_fps - (time.perf_counter()-started))
 
 
 class CASCADEUR_OT_live_link_start(bpy.types.Operator):
@@ -1201,6 +1218,8 @@ class CASCADEUR_OT_live_link_start(bpy.types.Operator):
     bl_description = "Start listening for real-time animation packets from Cascadeur"
 
     def execute(self, context):
+        global _last_preview
+        _last_preview = None
         global _receiver_thread, _stop_event, _packet_queue, _timer_registered, _last_frame_applied, _initial_root_pos
         global _bone_match_cache, _armature_depth_cache, _pelvis_bone_cache
         _initial_root_pos = None
@@ -1210,6 +1229,17 @@ class CASCADEUR_OT_live_link_start(bpy.types.Operator):
         _packet_arrival_times.clear()
 
         settings = context.scene.cascadeur_live_link
+
+        arm = settings.target_armature
+        if not arm:
+            self.report({'ERROR'}, 'Escolha Target Armature');return {'CANCELLED'}
+        if settings.pose_mapping_mode == 'GLOBAL_MATRIX' and any(b.use_connect for b in arm.data.bones):
+            self.report({'ERROR'}, 'Pare e clique Permitir translacao dos joints em Coordinate & Bone Mapping');return {'CANCELLED'}
+        pairs=[r for r in settings.bone_mapping if r.enabled]
+        if (len({r.target for r in pairs})!=len(pairs) or len({r.source for r in pairs})!=len(pairs)
+                or any(not r.source or not arm.pose.bones.get(r.target) for r in pairs)
+                or (settings.mapping_only and not pairs)):
+            self.report({'ERROR'}, 'Revise o perfil: pares vazios, duplicados ou ossos ausentes');return {'CANCELLED'}
 
         from . import live_sync
         live_sync.reset(settings.target_armature)
@@ -1595,7 +1625,7 @@ class CASCADEUR_OT_send_pose_to_cascadeur(bpy.types.Operator):
         if not settings.target_armature:
             settings.target_armature = arm_obj
 
-        if settings.pose_mapping_mode == 'GLOBAL_DELTA':
+        if settings.pose_mapping_mode in {'GLOBAL_DELTA', 'GLOBAL_MATRIX'}:
             try:
                 from .keyframe_bridge import send_pose
                 reply = send_pose(arm_obj, settings, context)

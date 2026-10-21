@@ -87,6 +87,8 @@ class VIEW3D_PT_cascadeur_live_link(bpy.types.Panel):
         col = box.column(align=True)
         col.prop(settings, "target_armature", text="")
         col.prop(settings, "character_rig_type", text="Rig Type")
+        col.label(text='Addon 1.4.0 | Perfis FK / deformacao')
+        col.label(text='Perfis e pares: abra Perfil de personagem abaixo')
 
         if settings.character_rig_type == "CC5":
             col.label(text="Profile: CC5 (Pelvis-Only Trans, 0.01 Scale)", icon="INFO")
@@ -145,6 +147,8 @@ class VIEW3D_PT_cascadeur_mapping(bpy.types.Panel):
 
         col = layout.column(align=True)
         col.prop(settings, "pose_mapping_mode", text="Pose Mode")
+        if settings.pose_mapping_mode == 'GLOBAL_MATRIX':
+            col.operator('cascadeur.prepare_joint_translation',icon='BONE_DATA')
         col.prop(settings, "coord_conversion", text="Conversion")
         col.prop(settings, "auto_map_synonyms", text="Smart Bone Matching")
         col.prop(settings, "apply_root_only_translation", text="Root Only Translation")
@@ -279,8 +283,40 @@ class VIEW3D_PT_cascadeur_timeline(bpy.types.Panel):
         col.operator("cascadeur.timeline_sync_active_frame", text="Sync Current Frame to Cascadeur", icon="TIME")
 
 
+
+class VIEW3D_PT_cascadeur_profiles(bpy.types.Panel):
+    bl_label='Perfil de personagem'
+    bl_idname='VIEW3D_PT_cascadeur_profiles'
+    bl_space_type='VIEW_3D'
+    bl_region_type='UI'
+    bl_category='CEB'
+    bl_parent_id='VIEW3D_PT_cascadeur_live_link'
+    bl_options={'DEFAULT_CLOSED'}
+    def draw(self,context):
+        settings=context.scene.cascadeur_live_link
+        col=self.layout.column(align=True)
+        col.prop(settings,'rig_profile')
+        col.operator('cascadeur.build_profile')
+        col.prop(settings,'mapping_only')
+        if settings.rig_profile in {'RIGIFY','ARP'}:
+            col.label(text='Use ossos FK/deformacao; IK requer bake.')
+        for i,pair in enumerate(settings.bone_mapping):
+            row=col.row(align=True)
+            row.prop(pair,'enabled',text='')
+            row.prop(pair,'source',text='')
+            if settings.target_armature:
+                row.prop_search(pair,'target',settings.target_armature.data,'bones',text='')
+            else:row.prop(pair,'target',text='')
+            row.operator('cascadeur.remove_bone_pair',text='',icon='X').index=i
+        col.operator('cascadeur.add_bone_pair',icon='ADD')
+        row=col.row(align=True)
+        row.operator('cascadeur.profile_file',text='Importar JSON').action='IMPORT'
+        row.operator('cascadeur.profile_file',text='Salvar JSON').action='EXPORT'
+
+
 classes = (
     VIEW3D_PT_cascadeur_live_link,
+    VIEW3D_PT_cascadeur_profiles,
     VIEW3D_PT_cascadeur_timeline,
     VIEW3D_PT_cascadeur_network,
     VIEW3D_PT_cascadeur_mapping,
